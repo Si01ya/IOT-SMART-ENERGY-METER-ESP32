@@ -1,0 +1,727 @@
+// ============================================================================
+// ESP32 100W IOT SMART ENERGY METER & POWER THEFT DETECTOR (FIXED & OPTIMIZED)
+// Arduino IDE Ready Firmware with Blynk Push Notification & State Latching
+// ============================================================================
+#define BLYNK_TEMPLATE_ID   "IoT Smart Energy Meter"
+#define BLYNK_TEMPLATE_NAME "IoT Smart Energy Meter"
+#define BLYNK_AUTH_TOKEN    "IoT Smart Energy Meter"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <math.h>
+
+// ============================================================================
+// BLYNK VIRTUAL PIN ASSIGNMENTS
+// ============================================================================
+#define VPIN_VOLTAGE        V1
+#define VPIN_SOURCE_CURRENT V2
+#define VPIN_LOAD_CURRENT   V3
+#define VPIN_ACTIVE_POWER   V4
+#define VPIN_ENERGY         V5
+#define VPIN_COST           V6
+#define VPIN_THEFT_ALARM    V7
+#define VPIN_RELAY_SWITCH   V8
+
+// ============================================================================
+// WIFI CREDENTIALS
+// ============================================================================
+const char* WIFI_SSID = "IoT Smart Energy Meter";
+const char* WIFI_PASS = "IoT Smart Energy Meter";
+#define ENABLE_DEBUG_SERIAL true
+
+// ============================================================================
+// HARDWARE PIN DEFINITIONS - 100W LOAD
+// ============================================================================
+#define VOLTAGE_PIN           32   // ZMPT101B AC Voltage Sensor
+#define CURRENT_SOURCE_PIN    34   // ACS712 #1 Feeder / Total Current Sensor
+#define CURRENT_LOAD_PIN      35   // ACS712 #2 Legal Load Current Sensor
+#define RELAY_LEGAL_PIN       13   // Main Load Control Relay (Active Low)
+#define RELAY_THEFT_PIN       26   // Theft Isolation Relay (Active Low)
+#define BUZZER_PIN            25   // Alarm Buzzer
+#define LED_RED_PIN           27   // Red LED (Fault / Theft Indicator)
+#define LED_GREEN_PIN         14   // Green LED (Normal Power Status)
+#define RESET_BUTTON_PIN      33   // Hardware Physical Latch Reset Button
+#define LCD_I2C_ADDRESS      0x27
+#define LCD_COLUMNS             16
+#define LCD_ROWS                 2
+
+// ============================================================================
+// ADC CONFIGURATION
+// ============================================================================
+#define ADC_RESOLUTION_BITS        12
+#define ADC_ATTENUATION_DB    ADC_11db
+#define ADC_MAX_VALUE           4095.0f
+#define ADC_MID_POINT            2048
+#define ADC_REF_VOLTAGE            3.3f
+
+// ============================================================================
+// SENSOR CALIBRATION
+// ============================================================================
+#define VOLTAGE_CALIBRATION_FACTOR    0.1259f
+#define VOLTAGE_NOISE_FLOOR_V         25.0f
+#define ACS712_SENSITIVITY_MV_PER_A   185.0f // 185 mV/A for ACS712-05B
+#define CURRENT_DISPLAY_NOISE_FLOOR_A 0.010f // 10mA noise floor
+
+// ============================================================================
+// THEFT DETECTION PARAMETERS (100W Bulb Load = 0.435A @ 230V)
+// ============================================================================
+#define MIN_CURRENT_FOR_THEFT_CHECK       0.150f  // Below 0.15A load is considered idle/off
+#define THEFT_CURRENT_DELTA_THRESHOLD_A   0.080f  // 80mA absolute theft current delta
+#define THEFT_RELATIVE_DELTA              0.30f   // 30% relative imbalance threshold
+#define THEFT_CONFIRM_STRIKES             2       // Requires 2 consecutive strike matches (~2 sec)
+#define RELAY_ACTIVE_LOW                  true    // Active low relay module
+
+// ============================================================================
+// POWER & TARIFF
+// ============================================================================
+#define TARGET_POWER_FACTOR       1.00f   // 100W Incandescent/Resistive Bulb PF = 1.0
+#define TARIFF_RATE_NPR_PER_KWH   8.50f   // NPR per kWh
+
+// ============================================================================
+// TIMING INTERVALS
+// ============================================================================
+#define SAMPLE_WINDOW_MS          40UL
+#define CORE_CALC_INTERVAL_MS     1000UL  // 1 Second core calculation interval
+#define BLYNK_PUSH_INTERVAL_MS    2000UL
+#define LCD_UPDATE_INTERVAL_MS    2500UL
+#define BOOT_WARMUP_TIME_MS       6000UL
+#define NVS_SAVE_INTERVAL_CYCLES  10
+#define DEBOUNCE_DELAY_MS         100UL
+#define WIFI_RETRY_INTERVAL_MS    10000UL
+#define SERIAL_BAUD_RATE          115200
+#define MICROS_PER_HOUR           3600000000.0
+
+// ============================================================================
+// GLOBAL STATE FLAGS (POWER THEFT & NOTIFICATIONS)
+// ============================================================================
+bool theftDetected = false;
+bool eventSent = false;
+
+struct SensorOffsets {
+    int voltagePin = ADC_MID_POINT;        // Dynamic ZMPT101B zero-offset calibration
+    int currentSourcePin = ADC_MID_POINT; // Dynamic ACS712 #1 zero-offset
+    int currentLoadPin = ADC_MID_POINT;   // Dynamic ACS712 #2 zero-offset
+};
+
+struct MeterReadings {
+    float voltageRMS = 0.0f;
+    float currentSourceRMS = 0.0f;
+    float currentLoadRMS = 0.0f;
+    float activePower = 0.0f;             // Real Active Power (Watts)
+    float apparentPower = 0.0f;           // Apparent Power (VA)
+    float powerFactor = 1.0f;             // Measured / Dynamic Power Factor
+    double totalEnergykWh = 0.0;
+    float totalCostNPR = 0.0f;
+};
+
+struct TheftDetectionState {
+    bool isLatched = false;               // Strict latching - NO auto-restore timer!
+    int strikeCount = 0;
+    float lastCurrentDifference = 0.0f;
+};
+
+struct SystemStatus {
+    int displayCycleState = 0;
+    int previousDisplayState = -2;
+    unsigned long lastCoreCalcMillis = 0;         // Dedicated millisecond timing
+    unsigned long lastEnergyIntegrationMicros = 0;// Dedicated microsecond timing variable for math
+    unsigned long bootTimestamp = 0;
+    unsigned long lastButtonPressMs = 0;
+    unsigned long lastConnectionAttemptMs = 0;
+    unsigned long lastDisplayUpdateMs = 0;
+    bool isButtonPressed = false;
+    bool resetActionDone = false;
+    bool isBootWarmupComplete = false;
+};
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
+SensorOffsets sensorOffsets;
+MeterReadings meter;
+TheftDetectionState theftState;
+SystemStatus sysStatus;
+
+LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+Preferences preferences;
+BlynkTimer blynkTimer;
+
+// ============================================================================
+// FUNCTION DECLARATIONS
+// ============================================================================
+void initializeHardware();
+void initializeBlynk();
+void maintainConnections();
+void calibrateSensors();
+void printVoltageCalibrationInstructions();
+void loadMeterData();
+void saveMeterData();
+void executeMetricCalculations();
+void pushMetricsToBlynk();
+void updateLCDDisplay();
+void handleResetButtonPress();
+void analyzePowerTheft();
+void isolatePowerDueToTheft();
+void restorePowerAfterTheft();
+float sampleVoltageRMS(int zeroOffset);
+float sampleCurrentRMS(int sensorPin, int zeroOffset); // Full True RMS Method
+float sampleActivePowerInstantaneous(int vZeroOffset, int iZeroOffset); // Real Active Power Sampling
+void setRelayOutput(bool enablePower);
+void logMessage(const char* category, const char* message);
+
+// ============================================================================
+// BLYNK CALLBACKS
+// ============================================================================
+BLYNK_CONNECTED() {
+    logMessage("BLYNK", "Connected to Blynk Cloud");
+    Blynk.syncVirtual(VPIN_RELAY_SWITCH);
+}
+
+BLYNK_WRITE(V8) {
+    int switchState = param.asInt();
+
+    // If theft protection is tripped, do not allow manual remote turn-on without resetting
+    if (theftState.isLatched || theftDetected) {
+        Blynk.virtualWrite(VPIN_RELAY_SWITCH, 0);
+        logMessage("THEFT", "Power locked due to theft! Press physical reset button on GPIO 33.");
+        return;
+    }
+
+    bool enablePower = (switchState == 1);
+    setRelayOutput(enablePower);
+    digitalWrite(LED_GREEN_PIN, enablePower ? HIGH : LOW);
+
+    logMessage("BLYNK", enablePower ? "Power ON (Blynk command)" : "Power OFF (Blynk command)");
+}
+
+// ============================================================================
+// SETUP AND MAIN LOOP
+// ============================================================================
+void setup() {
+    Serial.begin(SERIAL_BAUD_RATE);
+    delay(500);
+
+    logMessage("SYSTEM", "========== Smart Energy Meter 100W ==========");
+    printVoltageCalibrationInstructions();
+
+    initializeHardware();
+
+    // Zero-current ADC offset calibration (Keep load OFF during startup)
+    calibrateSensors();
+
+    // Restore standard operation post calibration
+    setRelayOutput(true);
+    digitalWrite(RELAY_THEFT_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    loadMeterData();
+    initializeBlynk();
+
+    // Schedule periodic tasks
+    blynkTimer.setInterval(CORE_CALC_INTERVAL_MS, executeMetricCalculations);
+    blynkTimer.setInterval(BLYNK_PUSH_INTERVAL_MS, pushMetricsToBlynk);
+    blynkTimer.setInterval(LCD_UPDATE_INTERVAL_MS, updateLCDDisplay);
+
+    sysStatus.lastCoreCalcMillis = millis();
+    sysStatus.lastEnergyIntegrationMicros = micros();
+    sysStatus.bootTimestamp = millis();
+    sysStatus.lastDisplayUpdateMs = millis();
+    sysStatus.lastConnectionAttemptMs = millis();
+
+    lcd.clear();
+    logMessage("SYSTEM", "Setup complete - Meter running");
+}
+
+void loop() {
+    maintainConnections();
+
+    if (Blynk.connected()) {
+        Blynk.run();
+    }
+
+    blynkTimer.run();
+    handleResetButtonPress();
+}
+
+// ============================================================================
+// HARDWARE & NETWORK INITIALIZATION
+// ============================================================================
+void initializeHardware() {
+    analogReadResolution(ADC_RESOLUTION_BITS);
+    analogSetAttenuation(ADC_ATTENUATION_DB);
+
+    pinMode(RELAY_LEGAL_PIN, OUTPUT);
+    pinMode(RELAY_THEFT_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
+    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+    setRelayOutput(false);
+    digitalWrite(RELAY_THEFT_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Smart Meter IoT");
+    lcd.setCursor(0, 1);
+    lcd.print("100W Calibrating");
+
+    logMessage("HARDWARE", "GPIO and I2C LCD initialized");
+}
+
+void initializeBlynk() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    Blynk.config(BLYNK_AUTH_TOKEN);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Connecting WiFi");
+    logMessage("BLYNK", "Starting Wi-Fi and Blynk connection");
+}
+
+void maintainConnections() {
+    unsigned long now = millis();
+
+    if (now - sysStatus.lastConnectionAttemptMs < WIFI_RETRY_INTERVAL_MS) {
+        return;
+    }
+
+    sysStatus.lastConnectionAttemptMs = now;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        logMessage("WIFI", "Wi-Fi disconnected - retrying connection");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        return;
+    }
+
+    if (!Blynk.connected()) {
+        logMessage("BLYNK", "Blynk disconnected - retrying cloud connection");
+        bool connected = Blynk.connect(1000);
+        if (connected) {
+            logMessage("BLYNK", "Blynk reconnected successfully");
+        }
+    }
+}
+
+void printVoltageCalibrationInstructions() {
+    Serial.println("[CALIB] Voltage calibration instructions:");
+    Serial.println("[CALIB] Measure mains voltage with trusted DMM.");
+    Serial.print("[CALIB] Current factor: ");
+    Serial.println(VOLTAGE_CALIBRATION_FACTOR, 6);
+    Serial.println("[CALIB] Formula: New Factor = Factor * (Actual_DMM_Volts / Displayed_Volts)");
+}
+
+void loadMeterData() {
+    if (!preferences.begin("meterData", false)) {
+        logMessage("NVS", "Preferences storage open failed");
+        return;
+    }
+    meter.totalEnergykWh = preferences.getDouble("energy", 0.0);
+    meter.totalCostNPR = preferences.getFloat("cost", 0.0f);
+    preferences.end();
+    
+    logMessage("NVS", "Persisted energy & cost data loaded from NVS");
+}
+
+void saveMeterData() {
+    if (!preferences.begin("meterData", false)) {
+        return;
+    }
+    preferences.putDouble("energy", meter.totalEnergykWh);
+    preferences.putFloat("cost", meter.totalCostNPR);
+    preferences.end();
+}
+
+void calibrateSensors() {
+    logMessage("CALIB", "Starting ADC zero-offset calibration (Voltage & Currents)");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Calib...");
+    lcd.setCursor(0, 1);
+    lcd.print("Keep Load OFF");
+
+    delay(1500);
+
+    long sumVoltagePin = 0;
+    long sumSourcePin = 0;
+    long sumLoadPin = 0;
+    const int totalSamples = 1000;
+
+    for (int i = 0; i < totalSamples; i++) {
+        sumVoltagePin += analogRead(VOLTAGE_PIN);
+        sumSourcePin += analogRead(CURRENT_SOURCE_PIN);
+        sumLoadPin += analogRead(CURRENT_LOAD_PIN);
+        delay(2);
+    }
+
+    sensorOffsets.voltagePin = sumVoltagePin / totalSamples;
+    sensorOffsets.currentSourcePin = sumSourcePin / totalSamples;
+    sensorOffsets.currentLoadPin = sumLoadPin / totalSamples;
+
+    Serial.print("[CALIB] ZMPT101B Voltage Offset: ");
+    Serial.println(sensorOffsets.voltagePin);
+    Serial.print("[CALIB] Source ACS712 Offset: ");
+    Serial.println(sensorOffsets.currentSourcePin);
+    Serial.print("[CALIB] Load ACS712 Offset: ");
+    Serial.println(sensorOffsets.currentLoadPin);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Calib Complete!");
+    delay(1000);
+}
+
+// ============================================================================
+// METRIC CALCULATIONS & ENERGY INTEGRATION
+// ============================================================================
+void executeMetricCalculations() {
+    // Microsecond delta integration for precise energy accumulator
+    unsigned long nowMicros = micros();
+    unsigned long deltaMicros = nowMicros - sysStatus.lastEnergyIntegrationMicros;
+    sysStatus.lastEnergyIntegrationMicros = nowMicros;
+
+    float deltaHours = (float)(deltaMicros / MICROS_PER_HOUR);
+
+    // Sample RMS AC waveforms with measured zero offsets
+    meter.voltageRMS = sampleVoltageRMS(sensorOffsets.voltagePin);
+    meter.currentSourceRMS = sampleCurrentRMS(CURRENT_SOURCE_PIN, sensorOffsets.currentSourcePin);
+    meter.currentLoadRMS = sampleCurrentRMS(CURRENT_LOAD_PIN, sensorOffsets.currentLoadPin);
+
+    // True Instantaneous Active Real Power (W) for any load type (Resistive, Inductive, Electronic)
+    meter.activePower = sampleActivePowerInstantaneous(sensorOffsets.voltagePin, sensorOffsets.currentLoadPin);
+    
+    // Apparent Power (VA) & Dynamic Power Factor Calculation (PF = Real Power / Apparent Power)
+    meter.apparentPower = meter.voltageRMS * meter.currentLoadRMS;
+    if (meter.apparentPower > 0.5f) {
+        meter.powerFactor = meter.activePower / meter.apparentPower;
+        if (meter.powerFactor > 1.0f) meter.powerFactor = 1.0f;
+        if (meter.powerFactor < 0.0f) meter.powerFactor = 0.0f;
+    } else {
+        meter.powerFactor = 1.0f;
+    }
+
+    // Energy & billing cost integration
+    meter.totalEnergykWh += (meter.activePower / 1000.0f) * deltaHours;
+    meter.totalCostNPR = meter.totalEnergykWh * TARIFF_RATE_NPR_PER_KWH;
+
+    // Save to ESP32 Flash NVS periodically
+    static int saveCounter = 0;
+    if (++saveCounter >= NVS_SAVE_INTERVAL_CYCLES) {
+        saveMeterData();
+        saveCounter = 0;
+    }
+
+    // Warmup safety check
+    if (millis() - sysStatus.bootTimestamp >= BOOT_WARMUP_TIME_MS) {
+        if (!sysStatus.isBootWarmupComplete) {
+            sysStatus.isBootWarmupComplete = true;
+            logMessage("BOOT", "Warmup time complete - power theft protection engaged");
+        }
+        analyzePowerTheft();
+    }
+}
+
+// ============================================================================
+// POWER THEFT DETECTION & BYPASS TESTING
+// ============================================================================
+// Feeder / Source Sensor (GPIO 34) measures TOTAL incoming line current (sourceCurrent).
+// Load Sensor (GPIO 35) measures LEGAL path current (loadCurrent).
+void analyzePowerTheft() {
+    float sourceCurrent = meter.currentSourceRMS;
+    float loadCurrent = meter.currentLoadRMS;
+
+    float currentDifference = fabs(sourceCurrent - loadCurrent);
+    theftState.lastCurrentDifference = currentDifference;
+
+    // 1. Theft Detection Logic
+    if (sourceCurrent > MIN_CURRENT_FOR_THEFT_CHECK && currentDifference > THEFT_CURRENT_DELTA_THRESHOLD_A) {
+        theftDetected = true;
+    } else {
+        if (!theftState.isLatched) {
+            theftDetected = false;
+        }
+    }
+
+    // 2. Strike Confirmation & Action
+    if (theftDetected) {
+        if (theftState.strikeCount < THEFT_CONFIRM_STRIKES) {
+            theftState.strikeCount++;
+        }
+
+        Serial.print("[THEFT DETECT] Strike #");
+        Serial.print(theftState.strikeCount);
+        Serial.print(" | Delta: ");
+        Serial.print(currentDifference, 3);
+        Serial.print("A | Isource: ");
+        Serial.print(sourceCurrent, 3);
+        Serial.print("A | Iload: ");
+        Serial.println(loadCurrent, 3);
+
+        if (theftState.strikeCount >= THEFT_CONFIRM_STRIKES && !eventSent) {
+            isolatePowerDueToTheft();
+        }
+    } else {
+        if (!theftState.isLatched) {
+            theftState.strikeCount = 0;
+            if (eventSent) {
+                // Theft cleared
+                restorePowerAfterTheft();
+            }
+        }
+    }
+}
+
+// ============================================================================
+// RELAY ISOLATION & BLYNK NOTIFICATION
+// ============================================================================
+void isolatePowerDueToTheft() {
+    theftState.isLatched = true;
+    theftDetected = true;
+    Serial.println("POWER THEFT DETECTED!");
+    logMessage("THEFT", "CRITICAL WARNING: UNAUTHORIZED POWER THEFT DETECTED - CUTTING POWER");
+
+    // Cutoff load & activate local indicators
+    setRelayOutput(false);
+    digitalWrite(RELAY_THEFT_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    // Send Blynk Notification & Update Dashboard
+    if (Blynk.connected()) {
+        // Send event to Blynk
+        Blynk.logEvent("power_theft", "⚠️ ALERT!
+Power Theft Detected.
+Relay Disconnected.");
+        Blynk.logEvent("theft_alert", "CRITICAL: Power Theft Detected on 100W Circuit!");
+
+        Blynk.virtualWrite(VPIN_THEFT_ALARM, 1); // Theft Alarm ON (V7)
+        Blynk.virtualWrite(VPIN_RELAY_SWITCH, 0); // Relay Switch OFF (V8)
+    }
+
+    eventSent = true;
+}
+
+void restorePowerAfterTheft() {
+    theftState.isLatched = false;
+    theftDetected = false;
+    theftState.strikeCount = 0;
+    theftState.lastCurrentDifference = 0.0f;
+
+    Serial.println("Power Theft Cleared");
+
+    setRelayOutput(true);
+    digitalWrite(RELAY_THEFT_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    sysStatus.lastEnergyIntegrationMicros = micros();
+    sysStatus.previousDisplayState = -2;
+
+    if (Blynk.connected()) {
+        Blynk.virtualWrite(VPIN_THEFT_ALARM, 0);
+        Blynk.virtualWrite(VPIN_RELAY_SWITCH, 1);
+    }
+
+    eventSent = false;
+    logMessage("RESET", "Theft fault cleared & power restored via reset!");
+}
+
+void handleResetButtonPress() {
+    if (!theftState.isLatched && !eventSent) {
+        sysStatus.isButtonPressed = false;
+        sysStatus.resetActionDone = false;
+        return;
+    }
+
+    bool pressed = (digitalRead(RESET_BUTTON_PIN) == LOW);
+    unsigned long now = millis();
+
+    if (!pressed) {
+        sysStatus.isButtonPressed = false;
+        sysStatus.resetActionDone = false;
+        return;
+    }
+
+    if (!sysStatus.isButtonPressed) {
+        sysStatus.isButtonPressed = true;
+        sysStatus.lastButtonPressMs = now;
+    }
+
+    if (!sysStatus.resetActionDone && (now - sysStatus.lastButtonPressMs >= DEBOUNCE_DELAY_MS)) {
+        sysStatus.resetActionDone = true;
+        restorePowerAfterTheft();
+    }
+}
+
+void setRelayOutput(bool enablePower) {
+    if (RELAY_ACTIVE_LOW) {
+        digitalWrite(RELAY_LEGAL_PIN, enablePower ? LOW : HIGH);
+    } else {
+        digitalWrite(RELAY_LEGAL_PIN, enablePower ? HIGH : LOW);
+    }
+}
+
+// ============================================================================
+// SENSOR SAMPLING (True RMS & Instantaneous Power Calculations)
+// ============================================================================
+// 1. Dynamic Zero-Offset AC Voltage RMS Calculation
+float sampleVoltageRMS(int zeroOffset) {
+    long long squaredSum = 0;
+    long sampleCount = 0;
+    unsigned long startTime = millis();
+
+    while (millis() - startTime < SAMPLE_WINDOW_MS) {
+        int rawADC = analogRead(VOLTAGE_PIN);
+        long offsetValue = rawADC - zeroOffset; // Uses measured zero offset from calibration
+        squaredSum += (long long)offsetValue * offsetValue;
+        sampleCount++;
+    }
+
+    if (sampleCount == 0) return 0.0f;
+
+    float meanSquare = (float)squaredSum / sampleCount;
+    float rmsValue = sqrt(meanSquare) * VOLTAGE_CALIBRATION_FACTOR;
+
+    return (rmsValue < VOLTAGE_NOISE_FLOOR_V) ? 0.0f : rmsValue;
+}
+
+// 2. Full True RMS Current Calculation over 80ms (2 AC cycles at 50Hz)
+float sampleCurrentRMS(int sensorPin, int zeroOffset) {
+    double squaredCurrentSum = 0.0;
+    unsigned long sampleCount = 0;
+    unsigned long startTime = millis();
+
+    while (millis() - startTime < (SAMPLE_WINDOW_MS * 2)) {
+        int rawADC = analogRead(sensorPin);
+        float sensorVoltage = ((float)(rawADC - zeroOffset) * ADC_REF_VOLTAGE) / ADC_MAX_VALUE;
+        float instantaneousCurrent = sensorVoltage / (ACS712_SENSITIVITY_MV_PER_A / 1000.0f);
+
+        squaredCurrentSum += (double)instantaneousCurrent * instantaneousCurrent;
+        sampleCount++;
+    }
+
+    if (sampleCount == 0) return 0.0f;
+
+    float currentRMS = sqrt(squaredCurrentSum / sampleCount);
+
+    return (currentRMS < CURRENT_DISPLAY_NOISE_FLOOR_A) ? 0.0f : currentRMS;
+}
+
+// 3. Instantaneous Real Active Power Calculation (Handles Non-Linear/Inductive/Electronic Loads)
+// P_active = Mean( v(t) * i(t) )
+float sampleActivePowerInstantaneous(int vZeroOffset, int iZeroOffset) {
+    double instantaneousPowerSum = 0.0;
+    unsigned long sampleCount = 0;
+    unsigned long startTime = millis();
+
+    while (millis() - startTime < (SAMPLE_WINDOW_MS * 2)) {
+        int rawVoltageADC = analogRead(VOLTAGE_PIN);
+        int rawCurrentADC = analogRead(CURRENT_LOAD_PIN);
+
+        // Instantaneous Voltage v(t)
+        float vInstantaneous = (rawVoltageADC - vZeroOffset) * VOLTAGE_CALIBRATION_FACTOR;
+        // Instantaneous Current i(t)
+        float sensorVoltage = ((float)(rawCurrentADC - iZeroOffset) * ADC_REF_VOLTAGE) / ADC_MAX_VALUE;
+        float iInstantaneous = sensorVoltage / (ACS712_SENSITIVITY_MV_PER_A / 1000.0f);
+
+        instantaneousPowerSum += (double)(vInstantaneous * iInstantaneous);
+        sampleCount++;
+    }
+
+    if (sampleCount == 0) return 0.0f;
+
+    float realPowerWatts = (float)(instantaneousPowerSum / sampleCount);
+    return (realPowerWatts < 0.5f) ? 0.0f : realPowerWatts;
+}
+
+// ============================================================================
+// BLYNK & LCD OUTPUT
+// ============================================================================
+void pushMetricsToBlynk() {
+    if (!Blynk.connected()) return;
+
+    Blynk.virtualWrite(VPIN_VOLTAGE, meter.voltageRMS);
+    Blynk.virtualWrite(VPIN_SOURCE_CURRENT, meter.currentSourceRMS);
+    Blynk.virtualWrite(VPIN_LOAD_CURRENT, meter.currentLoadRMS);
+    Blynk.virtualWrite(VPIN_ACTIVE_POWER, meter.activePower);
+    Blynk.virtualWrite(VPIN_ENERGY, meter.totalEnergykWh);
+    Blynk.virtualWrite(VPIN_COST, meter.totalCostNPR);
+    Blynk.virtualWrite(VPIN_THEFT_ALARM, (theftState.isLatched || theftDetected) ? 1 : 0);
+}
+
+void updateLCDDisplay() {
+    char line1[17];
+    char line2[17];
+
+    if (!sysStatus.isBootWarmupComplete) {
+        if (sysStatus.previousDisplayState != -3) {
+            lcd.clear();
+            sysStatus.previousDisplayState = -3;
+        }
+        lcd.setCursor(0, 0);
+        lcd.print("Smart Meter IoT");
+        lcd.setCursor(0, 1);
+        lcd.print("Warming Up...");
+        return;
+    }
+
+    if (theftState.isLatched || theftDetected) {
+        if (sysStatus.previousDisplayState != -1) {
+            lcd.clear();
+            sysStatus.previousDisplayState = -1;
+        }
+        lcd.setCursor(0, 0);
+        lcd.print("THEFT DETECTED!");
+        lcd.setCursor(0, 1);
+        lcd.print("PRESS RESET PIN");
+        return;
+    }
+
+    if (sysStatus.previousDisplayState != sysStatus.displayCycleState) {
+        lcd.clear();
+        sysStatus.previousDisplayState = sysStatus.displayCycleState;
+    }
+
+    if (sysStatus.displayCycleState == 0) {
+        snprintf(line1, sizeof(line1), "V:%3.0fV P:%5.1fW", meter.voltageRMS, meter.activePower);
+        snprintf(line2, sizeof(line2), "I1:%5.3fA I2:%5.3f", meter.currentSourceRMS, meter.currentLoadRMS);
+        sysStatus.displayCycleState = 1;
+    } else {
+        snprintf(line1, sizeof(line1), "E:%7.3fkWh", meter.totalEnergykWh);
+        snprintf(line2, sizeof(line2), "Cost:NRs.%7.2f", meter.totalCostNPR);
+        sysStatus.displayCycleState = 0;
+    }
+
+    lcd.setCursor(0, 0);
+    lcd.print(line1);
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+}
+
+void logMessage(const char* category, const char* message) {
+    if (!ENABLE_DEBUG_SERIAL) return;
+    Serial.print("[");
+    Serial.print(category);
+    Serial.print("] ");
+    Serial.println(message);
+}
